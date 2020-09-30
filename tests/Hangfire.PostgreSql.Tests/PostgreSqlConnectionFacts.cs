@@ -3,9 +3,9 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Linq;
-using System.Runtime.InteropServices.ComTypes;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Transactions;
 using Dapper;
 using Hangfire.Common;
 using Hangfire.Server;
@@ -28,7 +28,7 @@ namespace Hangfire.PostgreSql.Tests
 			_queue = new Mock<IPersistentJobQueue>();
 
 			_provider = new Mock<IPersistentJobQueueProvider>();
-			_provider.Setup(x => x.GetJobQueue(It.IsNotNull<IDbConnection>()))
+			_provider.Setup(x => x.GetJobQueue())
 				.Returns(_queue.Object);
 
 			_providers = new PersistentJobQueueProviderCollection(_provider.Object);
@@ -194,10 +194,10 @@ namespace Hangfire.PostgreSql.Tests
 				Assert.Null((long?) sqlJob.stateid);
 				Assert.Null((string) sqlJob.statename);
 
-				var invocationData = JobHelper.FromJson<InvocationData>((string) sqlJob.invocationdata);
+				var invocationData = SerializationHelper.Deserialize<InvocationData>((string) sqlJob.invocationdata);
 				invocationData.Arguments = sqlJob.arguments;
 
-				var job = invocationData.Deserialize();
+				var job = invocationData.DeserializeJob();
 				Assert.Equal(typeof (PostgreSqlConnectionFacts), job.Type);
 				Assert.Equal("SampleMethod", job.Method.Name);
 				Assert.Equal("Hello", job.Args[0]);
@@ -247,7 +247,7 @@ values (@invocationData, @arguments, @stateName, now() at time zone 'utc') retur
 					arrangeSql,
 					new
 					{
-						invocationData = JobHelper.ToJson(InvocationData.Serialize(job)),
+						invocationData = SerializationHelper.Serialize(InvocationData.SerializeJob(job)),
 						stateName = "Succeeded",
 						arguments = "[\"\\\"Arguments\\\"\"]"
                     }).Single().id;
@@ -316,7 +316,7 @@ returning ""id"";";
 
 				var stateId = (long) sql.Query(
 					createStateSql,
-					new {jobId = jobId, name = "Name", reason = "Reason", @data = JobHelper.ToJson(data)}).Single().id;
+					new {jobId = jobId, name = "Name", reason = "Reason", @data = SerializationHelper.Serialize(data)}).Single().id;
 
 				sql.Execute(updateJobStateSql, new {jobId = jobId, stateId = stateId});
 
@@ -342,7 +342,7 @@ values (@invocationData, @arguments, @stateName, now() at time zone 'utc') retur
 					arrangeSql,
 					new
 					{
-						invocationData = JobHelper.ToJson(new InvocationData(null, null, null, null)),
+						invocationData = SerializationHelper.Serialize(new InvocationData(null, null, null, null)),
 						stateName = "Succeeded",
 						arguments = "['Arguments']"
 					}).Single();
@@ -1324,7 +1324,63 @@ values (@key, @field, @value)";
 			});
 		}
 
-		private void UseConnections(Action<NpgsqlConnection, PostgreSqlConnection> action)
+        [Theory, CleanDatabase]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void CreateExpiredJob_EnlistsInTransaction(bool completeTransactionScope)
+        {
+            TransactionScope CreateTransactionScope(System.Transactions.IsolationLevel isolationLevel = System.Transactions.IsolationLevel.RepeatableRead)
+            {
+                var transactionOptions = new TransactionOptions()
+                {
+                    IsolationLevel = isolationLevel,
+                    Timeout = TransactionManager.MaximumTimeout
+                };
+
+                return new TransactionScope(TransactionScopeOption.Required, transactionOptions);
+            }
+
+            string jobId = null;
+            var createdAt = new DateTime(2012, 12, 12);
+            using (var scope = CreateTransactionScope())
+            {
+                UseConnections((sql, connection) =>
+                {
+                    jobId = connection.CreateExpiredJob(
+                        Job.FromExpression(() => SampleMethod("Hello")),
+                        new Dictionary<string, string> { { "Key1", "Value1" }, { "Key2", "Value2" } },
+                        createdAt,
+                        TimeSpan.FromDays(1));
+
+                    Assert.NotNull(jobId);
+                    Assert.NotEmpty(jobId);
+                });
+
+                if (completeTransactionScope)
+                {
+                    scope.Complete();
+                }
+            }
+
+            UseConnections((sql, connection) =>
+            {
+                if (completeTransactionScope)
+                {
+                    var sqlJob = sql.Query(@"select * from """ + GetSchemaName() + @""".""job""").Single();
+                    Assert.Equal(jobId, sqlJob.id.ToString());
+                    Assert.Equal(createdAt, sqlJob.createdat);
+                    Assert.Null((long?)sqlJob.stateid);
+                    Assert.Null((string)sqlJob.statename);
+                }
+                else
+                {
+                    var job = sql.Query(@"select * from """ + GetSchemaName() + @""".""job""").SingleOrDefault();
+                    Assert.Null(job);
+                }
+            });
+        }
+
+        private void UseConnections(Action<NpgsqlConnection, PostgreSqlConnection> action)
 		{
 			using (var sqlConnection = ConnectionUtils.CreateConnection())
 			using (var connection = new PostgreSqlConnection(sqlConnection, _providers, _options))
